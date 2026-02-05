@@ -6,14 +6,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
 
     <style>
+        /* allow page to scroll independently while keeping content centered */
+        html, body {
+            height: auto;
+            margin: 0;
+            padding: 0;
+        }
         body {
             font-family: Arial, sans-serif;
             background: #f4f6f8;
             display: flex;
             justify-content: center;
-            align-items: center;
-            height: 100vh;
-            margin: 0;
+            align-items: flex-start; /* let content flow top-to-bottom so page scrolls */
+            min-height: 100vh;
+            padding: 24px; /* spacing so card doesn't stick to edges */
+            box-sizing: border-box;
         }
 
         .card {
@@ -21,13 +28,30 @@
             padding: 24px;
             border-radius: 8px;
             width: 100%;
-            max-width: 420px;
+            max-width: 900px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.1);
             text-align: center;
+            margin: 0 auto;
         }
 
         h2 {
             margin-bottom: 12px;
+        }
+
+        .row {
+            display: flex;
+            gap: 16px;
+            margin-top: 12px;
+        }
+
+        .pane {
+            flex: 1;
+            border: 1px solid #e2e8f0;
+            padding: 12px;
+            border-radius: 6px;
+            min-height: 220px;
+            text-align: left;
+            background: #fff;
         }
 
         input[type="file"] {
@@ -55,59 +79,324 @@
             color: #555;
             margin-top: 12px;
         }
+
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 320px;
+            overflow: auto;
+            background: #fafafa;
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #eef2f7;
+            font-size: 13px;
+        }
+
+        .file-title { font-weight: 600; margin-bottom: 6px; }
+        .muted { color: #666; font-size: 13px; }
+
+        /* Table preview styles */
+        .table-wrap { background: #fafafa; padding: 8px; border-radius: 4px; border: 1px solid #eef2f7; }
+        .table-counter { margin-bottom: 8px; color: #666; font-size: 13px; }
+        /* scroll only the table body area; overall page still scrolls normally */
+        .table-scroll { max-height: 320px; overflow-y: auto; overflow-x: auto; position: relative; }
+        table.preview {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        table.preview th, table.preview td {
+            border: 1px solid #e6e9ee;
+            padding: 6px 8px;
+            text-align: left;
+        }
+        table.preview th {
+            background: #f1f5f9;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+
+        /* Column control styles */
+        .controls { margin: 8px 0 12px; text-align: left; }
+        .col-row { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+        .col-row input[type="text"] { flex:1; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; }
+        .col-row label { min-width:120px; font-size:13px; }
+        .controls-actions { display:flex; gap:8px; margin-top:8px; }
+
+        /* small controls */
+        .small-inputs { display:flex; gap:12px; align-items:center; justify-content:center; margin-top:8px; }
+        .small-inputs label { font-size:13px; color:#333; }
+        .small-inputs input[type="number"] { width:80px; padding:6px; border-radius:4px; border:1px solid #d1d5db; }
     </style>
 </head>
 <body>
 
 <div class="card">
-    <h2>Excel → CSV</h2>
+    <h2>Excel → CSV (multi-file merge)</h2>
 
-    <input type="file" id="fileInput" accept=".xlsx,.xls">
+    <input type="file" id="fileInput" accept=".xlsx,.xls" multiple>
 
-    <button id="convertBtn">Convert & Download CSV</button>
+    <!-- header / start row controls (user sets before Validate) -->
+    <div class="small-inputs">
+        <label>Header row:
+            <input id="headerRow" type="number" min="1" value="1" title="Which row contains the header (1-based)">
+        </label>
+        <label>Data start row:
+            <input id="startRow" type="number" min="1" value="2" title="Which row data begins (1-based)">
+        </label>
+    </div>
+
+    <div style="display:flex;gap:12px;margin-top:8px;">
+        <button id="validateBtn" style="flex:1">Validate & Preview</button>
+        <button id="downloadBtn" style="flex:1" disabled>Download Merged CSV</button>
+    </div>
+
+    <div class="row" style="margin-top:16px;">
+        <div class="pane" id="leftPane">
+            <div class="file-title">Rejected / Mismatched Headers</div>
+            <div id="rejectedList" class="muted">No files processed yet.</div>
+        </div>
+
+        <div class="pane" id="rightPane">
+            <div class="file-title">Merged CSV Preview</div>
+            <div id="mergeInfo" class="muted">No merged CSV yet.</div>
+
+            <!-- Column selection & rename controls -->
+            <div id="columnControls" class="controls" style="display:none"></div>
+
+            <div id="tablePreview" class="table-wrap" style="display:none"></div>
+            <pre id="csvPreview" style="display:none"></pre>
+        </div>
+    </div>
 
     <div class="note">
         Files are processed locally in your browser.<br>
-        Nothing is uploaded.
+        Merged only when all headers match the selected header row.
     </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
 
 <script>
-document.getElementById('convertBtn').addEventListener('click', () => {
+document.getElementById('validateBtn').addEventListener('click', async () => {
     const input = document.getElementById('fileInput');
+    const rejectedList = document.getElementById('rejectedList');
+    const csvPreview = document.getElementById('csvPreview');
+    const tablePreview = document.getElementById('tablePreview');
+    const mergeInfo = document.getElementById('mergeInfo');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const columnControls = document.getElementById('columnControls');
+    const headerRowInput = document.getElementById('headerRow');
+    const startRowInput = document.getElementById('startRow');
+
+    rejectedList.innerHTML = '';
+    mergeInfo.textContent = 'Processing...';
+    csvPreview.style.display = 'none';
+    csvPreview.textContent = '';
+    tablePreview.style.display = 'none';
+    tablePreview.innerHTML = '';
+    columnControls.style.display = 'none';
+    columnControls.innerHTML = '';
+    downloadBtn.disabled = true;
 
     if (!input.files.length) {
-        alert('Select an Excel file first');
+        alert('Select one or more Excel files first');
+        mergeInfo.textContent = 'No merged CSV yet.';
+        rejectedList.textContent = 'No files processed yet.';
         return;
     }
 
-    const file = input.files[0];
-    const reader = new FileReader();
+    // read header/start rows from inputs (1-based)
+    let headerRowVal = parseInt(headerRowInput.value, 10);
+    let startRowVal = parseInt(startRowInput.value, 10);
+    if (!Number.isFinite(headerRowVal) || headerRowVal < 1) headerRowVal = 1;
+    if (!Number.isFinite(startRowVal) || startRowVal < 1) startRowVal = headerRowVal + 1;
+    if (startRowVal <= headerRowVal) startRowVal = headerRowVal + 1;
+    // reflect corrected values back to inputs
+    headerRowInput.value = headerRowVal;
+    startRowInput.value = startRowVal;
 
-    reader.onload = (e) => {
-        const data = new Uint8Array(e.target.result);
-        const workbook = XLSX.read(data, { type: 'array' });
+    const files = Array.from(input.files);
 
-        // First sheet only (simple + predictable)
-        const sheetName = workbook.SheetNames[0];
-        const sheet = workbook.Sheets[sheetName];
+    // Read all files
+    const reads = files.map(file => new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            try {
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, { type: 'array' });
+                const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+                res({ file, rows });
+            } catch (err) { rej(err); }
+        };
+        reader.onerror = rej;
+        reader.readAsArrayBuffer(file);
+    }));
 
-        const csv = XLSX.utils.sheet_to_csv(sheet);
+    let results;
+    try {
+        results = await Promise.all(reads);
+    } catch (err) {
+        alert('Error reading files');
+        mergeInfo.textContent = 'Error reading files.';
+        return;
+    }
 
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
+    // pick header row based on user input (1-based -> index)
+    const firstHeader = results[0].rows[headerRowVal - 1] || [];
+    const toReject = [];
+    const toMerge = [];
 
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = file.name.replace(/\.(xlsx|xls)$/i, '.csv');
-        a.click();
+    results.forEach(r => {
+        const header = r.rows[headerRowVal - 1] || [];
+        if (JSON.stringify(header) !== JSON.stringify(firstHeader)) {
+            toReject.push({ name: r.file.name, header });
+        } else {
+            // append data rows starting from startRowVal (1-based)
+            const rows = r.rows.slice(startRowVal - 1);
+            toMerge.push(...rows);
+        }
+    });
 
-        URL.revokeObjectURL(url);
+    // Display rejected info
+    if (!toReject.length) {
+        rejectedList.innerHTML = '<span class="muted">All files match the selected header row.</span>';
+    } else {
+        rejectedList.innerHTML = '';
+        toReject.forEach(r => {
+            const el = document.createElement('div');
+            el.innerHTML = '<strong>' + r.name + '</strong><div class="muted">' + (r.header.length ? r.header.join(' | ') : '<em>no header</em>') + '</div><hr>';
+            rejectedList.appendChild(el);
+        });
+    }
+
+    if (toReject.length) {
+        mergeInfo.textContent = 'Merge blocked: some files have different headers.';
+        csvPreview.style.display = 'none';
+        tablePreview.style.display = 'none';
+        columnControls.style.display = 'none';
+        downloadBtn.disabled = true;
+        return;
+    }
+
+    // Build CSV helper: escape
+    const escapeCell = v => {
+        if (v === null || v === undefined) return '';
+        const s = String(v);
+        if (s.includes('"')) return '"' + s.replace(/"/g, '""') + '"';
+        if (s.includes(',') || s.includes('\n') || s.includes('\r')) return '"' + s + '"';
+        return s;
     };
 
-    reader.readAsArrayBuffer(file);
+    // Render table HTML (no counter here)
+    const renderTable = (headers, rows) => {
+        const ths = headers.map(h => '<th>' + (h === undefined || h === null ? '' : String(h)) + '</th>').join('');
+        const trs = rows.map(row => {
+            const cells = headers.map((_, i) => {
+                const v = (row && row[i] !== undefined) ? row[i] : '';
+                return '<td>' + (v === null || v === undefined ? '' : String(v)) + '</td>';
+            }).join('');
+            return '<tr>' + cells + '</tr>';
+        }).join('');
+        return '<table class="preview"><thead><tr>' + ths + '</tr></thead><tbody>' + trs + '</tbody></table>';
+    };
+
+    // Build CSV text from given headers and rows (rows: array of arrays aligned to headers)
+    const buildCSVText = (headers, rows) => {
+        const csvRows = [];
+        csvRows.push(headers.map(escapeCell).join(','));
+        rows.forEach(r => csvRows.push((r || []).map(escapeCell).join(',')));
+        return csvRows.join('\n');
+    };
+
+    // Render column selection controls (checkbox + rename input)
+    const renderColumnControls = (headers) => {
+        columnControls.innerHTML = '';
+        headers.forEach((h, idx) => {
+            const row = document.createElement('div');
+            row.className = 'col-row';
+            row.innerHTML = '<input type="checkbox" data-idx="' + idx + '" id="col_cb_' + idx + '" checked>' +
+                            '<label for="col_cb_' + idx + '">' + (h === undefined || h === null ? '' : String(h)) + '</label>' +
+                            '<input type="text" placeholder="Rename (optional)" data-idx="' + idx + '" id="col_rename_' + idx + '">';
+            columnControls.appendChild(row);
+        });
+
+        const actions = document.createElement('div');
+        actions.className = 'controls-actions';
+        const applyBtn = document.createElement('button');
+        applyBtn.textContent = 'Apply Columns';
+        applyBtn.type = 'button';
+        applyBtn.onclick = () => applySelectionAndRender(headers, toMerge);
+        const resetBtn = document.createElement('button');
+        resetBtn.textContent = 'Reset';
+        resetBtn.type = 'button';
+        resetBtn.onclick = () => {
+            // reset checks and renames
+            headers.forEach((_, i) => {
+                const cb = document.querySelector('#col_cb_' + i);
+                const inp = document.querySelector('#col_rename_' + i);
+                if (cb) cb.checked = true;
+                if (inp) inp.value = '';
+            });
+            applySelectionAndRender(headers, toMerge);
+        };
+        actions.appendChild(applyBtn);
+        actions.appendChild(resetBtn);
+        columnControls.appendChild(actions);
+        columnControls.style.display = 'block';
+    };
+
+    // Apply selection: read checked columns and rename inputs, then render table and CSV and enable download
+    const applySelectionAndRender = (headers, rows) => {
+        const selected = [];
+        const renames = {};
+        headers.forEach((_, i) => {
+            const cb = document.querySelector('#col_cb_' + i);
+            const inp = document.querySelector('#col_rename_' + i);
+            if (cb && cb.checked) {
+                selected.push(i);
+                if (inp && inp.value.trim()) renames[i] = inp.value.trim();
+            }
+        });
+
+        if (!selected.length) {
+            alert('Select at least one column to export.');
+            return;
+        }
+
+        // Build filtered headers and rows
+        const filteredHeaders = selected.map(i => renames[i] || (headers[i] === undefined || headers[i] === null ? '' : String(headers[i])));
+        const filteredRows = rows.map(r => selected.map(i => (r && r[i] !== undefined) ? r[i] : ''));
+
+        // Update table preview with counter above a scrollable table area
+        tablePreview.innerHTML = '<div class="table-counter">Items: ' + filteredRows.length + '</div><div class="table-scroll">' + renderTable(filteredHeaders, filteredRows) + '</div>';
+        tablePreview.style.display = 'block';
+
+        // Update CSV preview (hidden but kept for download)
+        const csvText = buildCSVText(filteredHeaders, filteredRows);
+        csvPreview.textContent = csvText;
+
+        // Update merge info and download button
+        mergeInfo.textContent = 'Merged ' + files.length + ' file(s). Columns exported: ' + filteredHeaders.length + '.';
+        downloadBtn.disabled = false;
+
+        // Update download action
+        downloadBtn.onclick = () => {
+            const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = (files.length === 1 ? files[0].name.replace(/\.(xlsx|xls)$/i, '.csv') : 'merged.csv');
+            a.click();
+            URL.revokeObjectURL(url);
+        };
+    };
+
+    // Initial render: show controls and default preview (all columns)
+    renderColumnControls(firstHeader);
+    applySelectionAndRender(firstHeader, toMerge);
 });
 </script>
 
