@@ -116,13 +116,30 @@
             top: 0;
             z-index: 1;
         }
+        td.editable { cursor: text; }
+        td.edited-cell { background: #fff7ed; }
+        tr.edited-row td { background: #fff7ed; }
+        tr.active-row td { outline: 2px solid #60a5fa; outline-offset: -2px; }
+        .edited-wrap { margin-top: 8px; text-align: left; }
+        .edited-title { font-size: 13px; color: #555; margin-bottom: 4px; }
+        .edited-list { font-size: 12px; color: #333; max-height: 120px; overflow: auto; border: 1px solid #eef2f7; border-radius: 4px; padding: 6px; background: #fafafa; }
+        .edited-list .muted { color: #777; }
+        .edit-bar { display:flex; gap:8px; align-items:center; justify-content:flex-start; margin:8px 0 4px; }
+        .edit-bar span { font-size: 12px; color:#555; }
+        .edit-bar button { width:auto; padding:6px 10px; font-size:12px; }
+        .ofx-controls { display:none; }
 
         /* Column control styles */
         .controls { margin: 8px 0 12px; text-align: left; }
         .col-row { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
         .col-row input[type="text"] { flex:1; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; }
+        .col-row .dup-wrap { display:flex; gap:6px; align-items:center; }
+        .col-row .dup-wrap label { min-width:auto; }
         .col-row label { min-width:120px; font-size:13px; }
         .controls-actions { display:flex; gap:8px; margin-top:8px; }
+        .filter-row { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+        .filter-row label { font-size:13px; min-width:120px; }
+        .filter-row select { padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; }
 
         /* small controls */
         .small-inputs { display:flex; gap:12px; align-items:center; justify-content:center; margin-top:8px; }
@@ -147,9 +164,24 @@
         </label>
     </div>
 
+    <div class="small-inputs" style="margin-top:8px;">
+        <label>Export format:
+            <select id="exportFormat" title="Choose export format" style="padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;">
+                <option value="csv">CSV</option>
+                <option value="tsv">TSV</option>
+                <option value="json">JSON</option>
+                <option value="xlsx">XLSX</option>
+                <option value="pdf">PDF</option>
+                <option value="ofx">OFX</option>
+                <option value="qfx">QFX</option>
+                <option value="qbo">QBO</option>
+            </select>
+        </label>
+    </div>
+
     <div style="display:flex;gap:12px;margin-top:8px;">
         <button id="validateBtn" style="flex:1">Validate & Preview</button>
-        <button id="downloadBtn" style="flex:1" disabled>Download Merged CSV</button>
+        <button id="downloadBtn" style="flex:1" disabled>Download Export</button>
     </div>
 
     <div class="row" style="margin-top:16px;">
@@ -166,6 +198,14 @@
             <div id="columnControls" class="controls" style="display:none"></div>
 
             <div id="tablePreview" class="table-wrap" style="display:none"></div>
+            <div id="editBar" class="edit-bar" style="display:none">
+                <span id="editBarText">Editing row: —</span>
+                <button type="button" id="finishEditBtn">Finish Editing Row</button>
+            </div>
+            <div id="editedItems" class="edited-wrap" style="display:none">
+                <div class="edited-title">Edited items</div>
+                <div id="editedList" class="edited-list"></div>
+            </div>
             <pre id="csvPreview" style="display:none"></pre>
         </div>
     </div>
@@ -179,6 +219,25 @@
 <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
 
 <script>
+const updateDownloadLabel = () => {
+    const exportFormat = document.getElementById('exportFormat');
+    const downloadBtn = document.getElementById('downloadBtn');
+    if (!exportFormat || !downloadBtn) return;
+    const fmt = exportFormat.value || 'csv';
+    const label = fmt === 'xlsx' ? 'XLSX' : fmt.toUpperCase();
+    downloadBtn.textContent = 'Download ' + label;
+};
+const updateOfxVisibility = () => {
+    const exportFormat = document.getElementById('exportFormat');
+    const show = exportFormat && (exportFormat.value === 'ofx' || exportFormat.value === 'qfx' || exportFormat.value === 'qbo');
+    const blocks = document.querySelectorAll('.ofx-controls');
+    blocks.forEach(el => { el.style.display = show ? 'flex' : 'none'; });
+};
+updateDownloadLabel();
+const exportFormatGlobal = document.getElementById('exportFormat');
+if (exportFormatGlobal) exportFormatGlobal.onchange = () => { updateDownloadLabel(); updateOfxVisibility(); };
+updateOfxVisibility();
+
 document.getElementById('validateBtn').addEventListener('click', async () => {
     const input = document.getElementById('fileInput');
     const rejectedList = document.getElementById('rejectedList');
@@ -187,6 +246,7 @@ document.getElementById('validateBtn').addEventListener('click', async () => {
     const mergeInfo = document.getElementById('mergeInfo');
     const downloadBtn = document.getElementById('downloadBtn');
     const columnControls = document.getElementById('columnControls');
+    const exportFormat = document.getElementById('exportFormat');
     const headerRowInput = document.getElementById('headerRow');
     const startRowInput = document.getElementById('startRow');
 
@@ -290,15 +350,169 @@ document.getElementById('validateBtn').addEventListener('click', async () => {
         return s;
     };
 
+    const buildDelimitedText = (headers, rows, delimiter) => {
+        const esc = (v) => {
+            if (v === null || v === undefined) return '';
+            const s = String(v);
+            if (s.includes('"') || s.includes(delimiter) || s.includes('\n') || s.includes('\r')) {
+                return '"' + s.replace(/"/g, '""') + '"';
+            }
+            return s;
+        };
+        const out = [];
+        out.push(headers.map(esc).join(delimiter));
+        rows.forEach(r => out.push((r || []).map(esc).join(delimiter)));
+        return out.join('\n');
+    };
+
+    const pickColumnIndex = (headers, candidates, fallbackIdx) => {
+        const lower = headers.map(h => (h === undefined || h === null) ? '' : String(h).toLowerCase());
+        for (const name of candidates) {
+            const idx = lower.indexOf(name);
+            if (idx >= 0) return idx;
+        }
+        return fallbackIdx;
+    };
+
+    const getOfxMapping = (headers) => {
+        const dateSel = document.getElementById('ofxDateCol');
+        const amtSel = document.getElementById('ofxAmtCol');
+        const fitSel = document.getElementById('ofxFitIdCol');
+        const nameSel = document.getElementById('ofxNameCol');
+        const trnTypeSel = document.getElementById('ofxTrnTypeCol');
+        const trnTypeFixed = document.getElementById('ofxTrnTypeFixed');
+        const dateIdx = (dateSel && dateSel.value !== '') ? parseInt(dateSel.value, 10)
+            : pickColumnIndex(headers, ['date', 'dtposted', 'posted', 'transaction date'], 0);
+        const amtIdx = (amtSel && amtSel.value !== '') ? parseInt(amtSel.value, 10)
+            : pickColumnIndex(headers, ['amount', 'amt', 'value'], 1);
+        const fitIdx = (fitSel && fitSel.value !== '') ? parseInt(fitSel.value, 10)
+            : pickColumnIndex(headers, ['fitid', 'id', 'transaction id'], 2);
+        const nameIdx = (nameSel && nameSel.value !== '') ? parseInt(nameSel.value, 10)
+            : pickColumnIndex(headers, ['name', 'memo', 'description', 'payee'], 3);
+        const trnTypeIdx = (trnTypeSel && trnTypeSel.value !== '') ? parseInt(trnTypeSel.value, 10) : null;
+        return {
+            dateIdx: Number.isFinite(dateIdx) ? dateIdx : 0,
+            amtIdx: Number.isFinite(amtIdx) ? amtIdx : 1,
+            fitIdx: Number.isFinite(fitIdx) ? fitIdx : 2,
+            nameIdx: Number.isFinite(nameIdx) ? nameIdx : 3,
+            trnTypeIdx: Number.isFinite(trnTypeIdx) ? trnTypeIdx : null,
+            trnTypeFixed: trnTypeFixed ? trnTypeFixed.value.trim() : ''
+        };
+    };
+
+    const formatOfxDate = (d) => {
+        const pad = (n) => String(n).padStart(2, '0');
+        return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate());
+    };
+
+    const buildOfxText = (headers, rows) => {
+        // Use user mapping if provided; fallback to best-effort mapping
+        const mapping = getOfxMapping(headers);
+        const dateIdx = mapping.dateIdx;
+        const amtIdx = mapping.amtIdx;
+        const fitIdx = mapping.fitIdx;
+        const nameIdx = mapping.nameIdx;
+        const trnTypeIdx = mapping.trnTypeIdx;
+        const trnTypeFixed = mapping.trnTypeFixed;
+        const now = new Date();
+        const asof = formatOfxDate(now);
+        const header = [
+            'OFXHEADER:100',
+            'DATA:OFXSGML',
+            'VERSION:102',
+            'SECURITY:NONE',
+            'ENCODING:USASCII',
+            'CHARSET:1252',
+            'COMPRESSION:NONE',
+            'OLDFILEUID:NONE',
+            'NEWFILEUID:NONE',
+            '',
+        ].join('\n');
+        const stmt = rows.map((r, i) => {
+            const rawDate = r && r[dateIdx] !== undefined ? String(r[dateIdx]) : '';
+            const rawAmt = r && r[amtIdx] !== undefined ? String(r[amtIdx]) : '';
+            const name = r && r[nameIdx] !== undefined ? String(r[nameIdx]) : '';
+            const rawFit = r && r[fitIdx] !== undefined ? String(r[fitIdx]) : '';
+            const rawType = (trnTypeIdx !== null && r && r[trnTypeIdx] !== undefined) ? String(r[trnTypeIdx]) : '';
+            const dtposted = rawDate ? rawDate.replace(/[^0-9]/g, '').slice(0, 8) || asof : asof;
+            const amt = rawAmt || '0';
+            const trnType = (trnTypeFixed || rawType || 'OTHER').toUpperCase();
+            const fitid = rawFit || String(i + 1);
+            return [
+                '<STMTTRN>',
+                '<TRNTYPE>' + trnType,
+                '<DTPOSTED>' + dtposted,
+                '<TRNAMT>' + amt,
+                '<FITID>' + fitid,
+                '<NAME>' + name,
+                '</STMTTRN>'
+            ].join('\n');
+        }).join('\n');
+        const ofxBody = [
+            '<OFX>',
+            '<SIGNONMSGSRSV1>',
+            '<SONRS>',
+            '<STATUS><CODE>0</CODE><SEVERITY>INFO</SEVERITY></STATUS>',
+            '<DTSERVER>' + asof,
+            '<LANGUAGE>ENG',
+            '</SONRS>',
+            '</SIGNONMSGSRSV1>',
+            '<BANKMSGSRSV1>',
+            '<STMTTRNRS>',
+            '<TRNUID>1',
+            '<STATUS><CODE>0</CODE><SEVERITY>INFO</SEVERITY></STATUS>',
+            '<STMTRS>',
+            '<CURDEF>USD',
+            '<BANKACCTFROM>',
+            '<BANKID>000000000',
+            '<ACCTID>000000000',
+            '<ACCTTYPE>CHECKING',
+            '</BANKACCTFROM>',
+            '<BANKTRANLIST>',
+            '<DTSTART>' + asof,
+            '<DTEND>' + asof,
+            stmt,
+            '</BANKTRANLIST>',
+            '<LEDGERBAL><BALAMT>0</BALAMT><DTASOF>' + asof + '</DTASOF></LEDGERBAL>',
+            '</STMTRS>',
+            '</STMTTRNRS>',
+            '</BANKMSGSRSV1>',
+            '</OFX>'
+        ].join('\n');
+        return header + ofxBody;
+    };
+
+    const openPdfPreview = (headers, rows) => {
+        const win = window.open('', '_blank');
+        if (!win) {
+            alert('Popup blocked. Allow popups to export PDF.');
+            return;
+        }
+        const tableHtml = renderTable(headers, rows);
+        win.document.write('<html><head><title>Export PDF</title>');
+        win.document.write('<style>body{font-family:Arial, sans-serif;padding:16px;} table{width:100%;border-collapse:collapse;font-size:12px;} th,td{border:1px solid #ddd;padding:6px;text-align:left;} th{background:#f1f5f9;}</style>');
+        win.document.write('</head><body>');
+        win.document.write(tableHtml);
+        win.document.write('</body></html>');
+        win.document.close();
+        win.focus();
+        win.print();
+    };
+
+    let currentHeaders = [];
+    let currentRows = [];
+    let editedCells = new Map();
+    let activeRowIndex = null;
+
     // Render table HTML (no counter here)
     const renderTable = (headers, rows) => {
         const ths = headers.map(h => '<th>' + (h === undefined || h === null ? '' : String(h)) + '</th>').join('');
-        const trs = rows.map(row => {
+        const trs = rows.map((row, rIdx) => {
             const cells = headers.map((_, i) => {
                 const v = (row && row[i] !== undefined) ? row[i] : '';
-                return '<td>' + (v === null || v === undefined ? '' : String(v)) + '</td>';
+                return '<td class="editable" data-row="' + rIdx + '" data-col="' + i + '">' + (v === null || v === undefined ? '' : String(v)) + '</td>';
             }).join('');
-            return '<tr>' + cells + '</tr>';
+            return '<tr data-row="' + rIdx + '">' + cells + '</tr>';
         }).join('');
         return '<table class="preview"><thead><tr>' + ths + '</tr></thead><tbody>' + trs + '</tbody></table>';
     };
@@ -311,15 +525,163 @@ document.getElementById('validateBtn').addEventListener('click', async () => {
         return csvRows.join('\n');
     };
 
+    let addedColumns = [];
+
     // Render column selection controls (checkbox + rename input)
     const renderColumnControls = (headers) => {
         columnControls.innerHTML = '';
+
+        // Filter controls: remove rows based on a specific column having or not having a value
+        const filterRow = document.createElement('div');
+        filterRow.className = 'filter-row';
+        const filterColOptions = headers.map((h, i) => {
+            const label = (h === undefined || h === null || String(h).trim() === '') ? ('Column ' + (i + 1)) : String(h);
+            return '<option value="' + i + '">' + label + '</option>';
+        }).join('');
+        filterRow.innerHTML =
+            '<label for="filterCol">Row filter:</label>' +
+            '<select id="filterRule">' +
+                '<option value="none">No filter</option>' +
+                '<option value="has">Remove rows where column has a value</option>' +
+                '<option value="empty">Remove rows where column is empty</option>' +
+            '</select>' +
+            '<select id="filterCol">' + filterColOptions + '</select>';
+        columnControls.appendChild(filterRow);
+        const filterRuleEl = filterRow.querySelector('#filterRule');
+        const filterColEl = filterRow.querySelector('#filterCol');
+        if (filterRuleEl) filterRuleEl.onchange = () => applySelectionAndRender(headers, toMerge);
+        if (filterColEl) filterColEl.onchange = () => applySelectionAndRender(headers, toMerge);
+
+        // Add-column controls
+        const addRow = document.createElement('div');
+        addRow.className = 'filter-row';
+        addRow.innerHTML =
+            '<label for="addColName">Add column:</label>' +
+            '<input type="text" id="addColName" placeholder="Column name" style="padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;flex:1">' +
+            '<input type="text" id="addColValue" placeholder="Default value (optional)" style="padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;flex:1">' +
+            '<button type="button" id="addColBtn" style="width:auto;padding:6px 10px;font-size:13px">Add</button>';
+        columnControls.appendChild(addRow);
+
+        const addedList = document.createElement('div');
+        addedList.id = 'addedColumnsList';
+        addedList.style.marginBottom = '8px';
+        columnControls.appendChild(addedList);
+
+        const renderAddedList = () => {
+            addedList.innerHTML = '';
+            if (!addedColumns.length) return;
+            addedColumns.forEach((c, i) => {
+                const row = document.createElement('div');
+                row.className = 'col-row';
+                row.innerHTML =
+                    '<label>Added</label>' +
+                    '<div style="flex:1;font-size:13px">' + c.name + (c.value !== '' ? ' = ' + c.value : '') + '</div>' +
+                    '<button type="button" data-idx="' + i + '" style="width:auto;padding:6px 10px;font-size:13px">Remove</button>';
+                row.querySelector('button').onclick = () => {
+                    addedColumns.splice(i, 1);
+                    renderAddedList();
+                    applySelectionAndRender(headers, toMerge);
+                };
+                addedList.appendChild(row);
+            });
+        };
+        renderAddedList();
+
+        const addBtn = addRow.querySelector('#addColBtn');
+        if (addBtn) addBtn.onclick = () => {
+            const nameEl = addRow.querySelector('#addColName');
+            const valEl = addRow.querySelector('#addColValue');
+            const name = nameEl ? nameEl.value.trim() : '';
+            const value = valEl ? valEl.value : '';
+            if (!name) {
+                alert('Enter a column name to add.');
+                return;
+            }
+            addedColumns.push({ name, value });
+            if (nameEl) nameEl.value = '';
+            if (valEl) valEl.value = '';
+            renderAddedList();
+            applySelectionAndRender(headers, toMerge);
+        };
+
+        // De-duplicate controls
+        const dedupRow = document.createElement('div');
+        dedupRow.className = 'filter-row';
+        const dedupOptions = headers.map((h, i) => {
+            const label = (h === undefined || h === null || String(h).trim() === '') ? ('Column ' + (i + 1)) : String(h);
+            return '<option value="' + i + '">' + label + '</option>';
+        }).join('');
+        dedupRow.innerHTML =
+            '<label for="dedupCol">Remove duplicates:</label>' +
+            '<select id="dedupRule">' +
+                '<option value="none">No de-dupe</option>' +
+                '<option value="first">Keep first occurrence</option>' +
+                '<option value="last">Keep last occurrence</option>' +
+            '</select>' +
+            '<select id="dedupCol">' + dedupOptions + '</select>';
+        columnControls.appendChild(dedupRow);
+        const dedupRuleEl = dedupRow.querySelector('#dedupRule');
+        const dedupColEl = dedupRow.querySelector('#dedupCol');
+        if (dedupRuleEl) dedupRuleEl.onchange = () => applySelectionAndRender(headers, toMerge);
+        if (dedupColEl) dedupColEl.onchange = () => applySelectionAndRender(headers, toMerge);
+
+        // Sort controls
+        const sortRow = document.createElement('div');
+        sortRow.className = 'filter-row';
+        const sortOptions = headers.map((h, i) => {
+            const label = (h === undefined || h === null || String(h).trim() === '') ? ('Column ' + (i + 1)) : String(h);
+            return '<option value="' + i + '">' + label + '</option>';
+        }).join('');
+        sortRow.innerHTML =
+            '<label for="sortCol">Sort rows:</label>' +
+            '<select id="sortRule">' +
+                '<option value="none">No sorting</option>' +
+                '<option value="asc">Ascending</option>' +
+                '<option value="desc">Descending</option>' +
+            '</select>' +
+            '<select id="sortCol">' + sortOptions + '</select>';
+        columnControls.appendChild(sortRow);
+        const sortRuleEl = sortRow.querySelector('#sortRule');
+        const sortColEl = sortRow.querySelector('#sortCol');
+        if (sortRuleEl) sortRuleEl.onchange = () => applySelectionAndRender(headers, toMerge);
+        if (sortColEl) sortColEl.onchange = () => applySelectionAndRender(headers, toMerge);
+
+        // OFX/QFX/QBO mapping controls
+        const ofxRow = document.createElement('div');
+        ofxRow.className = 'filter-row ofx-controls';
+        ofxRow.innerHTML =
+            '<label>OFX mapping:</label>' +
+            '<select id="ofxDateCol" title="DTPOSTED"></select>' +
+            '<select id="ofxAmtCol" title="TRNAMT"></select>' +
+            '<select id="ofxFitIdCol" title="FITID"></select>' +
+            '<select id="ofxNameCol" title="NAME"></select>';
+        columnControls.appendChild(ofxRow);
+
+        const ofxRow2 = document.createElement('div');
+        ofxRow2.className = 'filter-row ofx-controls';
+        ofxRow2.innerHTML =
+            '<label>TRNTYPE:</label>' +
+            '<select id="ofxTrnTypeCol" title="TRNTYPE column"></select>' +
+            '<input type="text" id="ofxTrnTypeFixed" placeholder="Fixed TRNTYPE (optional)" style="padding:6px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;flex:1">';
+        columnControls.appendChild(ofxRow2);
+
+        const ofxNote = document.createElement('div');
+        ofxNote.className = 'muted ofx-controls';
+        ofxNote.style.marginBottom = '8px';
+        ofxNote.textContent = 'Used for OFX/QFX/QBO export: DTPOSTED (date posted), TRNAMT (amount), FITID (unique transaction ID), NAME (short description), TRNTYPE (transaction type).';
+        columnControls.appendChild(ofxNote);
+
         headers.forEach((h, idx) => {
             const row = document.createElement('div');
             row.className = 'col-row';
             row.innerHTML = '<input type="checkbox" data-idx="' + idx + '" id="col_cb_' + idx + '" checked>' +
                             '<label for="col_cb_' + idx + '">' + (h === undefined || h === null ? '' : String(h)) + '</label>' +
-                            '<input type="text" placeholder="Rename (optional)" data-idx="' + idx + '" id="col_rename_' + idx + '">';
+                            '<input type="text" placeholder="Rename (optional)" data-idx="' + idx + '" id="col_rename_' + idx + '">' +
+                            '<span class="dup-wrap">' +
+                                '<input type="checkbox" data-idx="' + idx + '" id="col_dup_' + idx + '">' +
+                                '<label for="col_dup_' + idx + '">Duplicate</label>' +
+                            '</span>' +
+                            '<input type="text" placeholder="Duplicate names (comma-separated)" data-idx="' + idx + '" id="col_dup_name_' + idx + '">';
             columnControls.appendChild(row);
         });
 
@@ -337,9 +699,40 @@ document.getElementById('validateBtn').addEventListener('click', async () => {
             headers.forEach((_, i) => {
                 const cb = document.querySelector('#col_cb_' + i);
                 const inp = document.querySelector('#col_rename_' + i);
+                const dupCb = document.querySelector('#col_dup_' + i);
+                const dupName = document.querySelector('#col_dup_name_' + i);
                 if (cb) cb.checked = true;
                 if (inp) inp.value = '';
+                if (dupCb) dupCb.checked = false;
+                if (dupName) dupName.value = '';
             });
+            const filterRule = document.getElementById('filterRule');
+            if (filterRule) filterRule.value = 'none';
+            const filterCol = document.getElementById('filterCol');
+            if (filterCol) filterCol.selectedIndex = 0;
+            const dedupRule = document.getElementById('dedupRule');
+            if (dedupRule) dedupRule.value = 'none';
+            const dedupCol = document.getElementById('dedupCol');
+            if (dedupCol) dedupCol.selectedIndex = 0;
+            const sortRule = document.getElementById('sortRule');
+            if (sortRule) sortRule.value = 'none';
+            const sortCol = document.getElementById('sortCol');
+            if (sortCol) sortCol.selectedIndex = 0;
+            const ofxDate = document.getElementById('ofxDateCol');
+            const ofxAmt = document.getElementById('ofxAmtCol');
+            const ofxFit = document.getElementById('ofxFitIdCol');
+            const ofxName = document.getElementById('ofxNameCol');
+            const ofxType = document.getElementById('ofxTrnTypeCol');
+            const ofxFixed = document.getElementById('ofxTrnTypeFixed');
+            if (ofxDate) ofxDate.selectedIndex = 0;
+            if (ofxAmt) ofxAmt.selectedIndex = 0;
+            if (ofxFit) ofxFit.selectedIndex = 0;
+            if (ofxName) ofxName.selectedIndex = 0;
+            if (ofxType) ofxType.selectedIndex = 0;
+            if (ofxFixed) ofxFixed.value = '';
+            addedColumns = [];
+            const list = document.getElementById('addedColumnsList');
+            if (list) list.innerHTML = '';
             applySelectionAndRender(headers, toMerge);
         };
         actions.appendChild(applyBtn);
@@ -350,14 +743,98 @@ document.getElementById('validateBtn').addEventListener('click', async () => {
 
     // Apply selection: read checked columns and rename inputs, then render table and CSV and enable download
     const applySelectionAndRender = (headers, rows) => {
+        const isEmptyCell = (v) => v === null || v === undefined || String(v).trim() === '';
+
+        // Apply row filter if configured
+        const filterRule = document.getElementById('filterRule');
+        const filterCol = document.getElementById('filterCol');
+        let filteredInputRows = rows;
+        if (filterRule && filterCol && filterRule.value !== 'none') {
+            const colIdx = parseInt(filterCol.value, 10);
+            if (Number.isFinite(colIdx)) {
+                if (filterRule.value === 'has') {
+                    // remove rows where column has any value -> keep empty only
+                    filteredInputRows = rows.filter(r => isEmptyCell(r ? r[colIdx] : undefined));
+                } else if (filterRule.value === 'empty') {
+                    // remove rows where column is empty -> keep non-empty only
+                    filteredInputRows = rows.filter(r => !isEmptyCell(r ? r[colIdx] : undefined));
+                }
+            }
+        }
+
+        // Apply de-duplication if configured
+        const dedupRule = document.getElementById('dedupRule');
+        const dedupCol = document.getElementById('dedupCol');
+        let dedupedRows = filteredInputRows;
+        if (dedupRule && dedupCol && dedupRule.value !== 'none') {
+            const colIdx = parseInt(dedupCol.value, 10);
+            if (Number.isFinite(colIdx)) {
+                if (dedupRule.value === 'first') {
+                    const seen = new Set();
+                    dedupedRows = filteredInputRows.filter(r => {
+                        const key = (r && r[colIdx] !== undefined) ? String(r[colIdx]) : '';
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    });
+                } else if (dedupRule.value === 'last') {
+                    const seen = new Set();
+                    const out = [];
+                    for (let i = filteredInputRows.length - 1; i >= 0; i--) {
+                        const r = filteredInputRows[i];
+                        const key = (r && r[colIdx] !== undefined) ? String(r[colIdx]) : '';
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        out.push(r);
+                    }
+                    dedupedRows = out.reverse();
+                }
+            }
+        }
+
+        // Apply sorting if configured
+        const sortRule = document.getElementById('sortRule');
+        const sortCol = document.getElementById('sortCol');
+        let sortedRows = dedupedRows;
+        if (sortRule && sortCol && sortRule.value !== 'none') {
+            const colIdx = parseInt(sortCol.value, 10);
+            if (Number.isFinite(colIdx)) {
+                const dir = sortRule.value === 'desc' ? -1 : 1;
+                sortedRows = [...dedupedRows].sort((a, b) => {
+                    const av = a && a[colIdx] !== undefined ? a[colIdx] : '';
+                    const bv = b && b[colIdx] !== undefined ? b[colIdx] : '';
+                    const aEmpty = av === null || av === undefined || String(av).trim() === '';
+                    const bEmpty = bv === null || bv === undefined || String(bv).trim() === '';
+                    if (aEmpty && bEmpty) return 0;
+                    if (aEmpty) return 1; // empty last
+                    if (bEmpty) return -1;
+                    const aNum = Number(av);
+                    const bNum = Number(bv);
+                    if (Number.isFinite(aNum) && Number.isFinite(bNum)) {
+                        return (aNum - bNum) * dir;
+                    }
+                    return String(av).localeCompare(String(bv)) * dir;
+                });
+            }
+        }
+
         const selected = [];
         const renames = {};
+        const duplicates = {};
         headers.forEach((_, i) => {
             const cb = document.querySelector('#col_cb_' + i);
             const inp = document.querySelector('#col_rename_' + i);
+            const dupCb = document.querySelector('#col_dup_' + i);
+            const dupName = document.querySelector('#col_dup_name_' + i);
             if (cb && cb.checked) {
                 selected.push(i);
                 if (inp && inp.value.trim()) renames[i] = inp.value.trim();
+                if (dupCb && dupCb.checked && dupName && dupName.value.trim()) {
+                    const names = dupName.value.split(',')
+                        .map(s => s.trim())
+                        .filter(Boolean);
+                    if (names.length) duplicates[i] = names;
+                }
             }
         });
 
@@ -367,30 +844,216 @@ document.getElementById('validateBtn').addEventListener('click', async () => {
         }
 
         // Build filtered headers and rows
-        const filteredHeaders = selected.map(i => renames[i] || (headers[i] === undefined || headers[i] === null ? '' : String(headers[i])));
-        const filteredRows = rows.map(r => selected.map(i => (r && r[i] !== undefined) ? r[i] : ''));
+        const filteredHeaders = [];
+        const filteredRows = sortedRows.map(() => []);
+        selected.forEach((i, rowIdx) => {
+            const baseHeader = renames[i] || (headers[i] === undefined || headers[i] === null ? '' : String(headers[i]));
+            filteredHeaders.push(baseHeader);
+            sortedRows.forEach((r, ri) => {
+                filteredRows[ri].push((r && r[i] !== undefined) ? r[i] : '');
+            });
+            if (duplicates[i] && duplicates[i].length) {
+                duplicates[i].forEach((dupName) => {
+                    filteredHeaders.push(dupName);
+                    sortedRows.forEach((r, ri) => {
+                        filteredRows[ri].push((r && r[i] !== undefined) ? r[i] : '');
+                    });
+                });
+            }
+        });
+
+        if (addedColumns.length) {
+            addedColumns.forEach((c) => {
+                filteredHeaders.push(c.name);
+                filteredRows.forEach((r) => r.push(c.value));
+            });
+        }
+
+        currentHeaders = filteredHeaders;
+        currentRows = filteredRows;
+        editedCells = new Map();
+        activeRowIndex = null;
+
+        // Populate OFX/QFX/QBO mapping selects based on current headers
+        const ofxDate = document.getElementById('ofxDateCol');
+        const ofxAmt = document.getElementById('ofxAmtCol');
+        const ofxFit = document.getElementById('ofxFitIdCol');
+        const ofxName = document.getElementById('ofxNameCol');
+        const ofxType = document.getElementById('ofxTrnTypeCol');
+        if (ofxDate && ofxAmt && ofxFit && ofxName && ofxType) {
+            const makeOptions = (selectedIdx) => {
+                return currentHeaders.map((h, i) => {
+                    const label = (h === undefined || h === null || String(h).trim() === '') ? ('Column ' + (i + 1)) : String(h);
+                    const sel = (i === selectedIdx) ? ' selected' : '';
+                    return '<option value="' + i + '"' + sel + '>' + label + '</option>';
+                }).join('');
+            };
+            const guess = getOfxMapping(currentHeaders);
+            ofxDate.innerHTML = makeOptions(guess.dateIdx);
+            ofxAmt.innerHTML = makeOptions(guess.amtIdx);
+            ofxFit.innerHTML = makeOptions(guess.fitIdx);
+            ofxName.innerHTML = makeOptions(guess.nameIdx);
+            ofxType.innerHTML = makeOptions(guess.trnTypeIdx !== null ? guess.trnTypeIdx : guess.nameIdx);
+        }
+        updateOfxVisibility();
 
         // Update table preview with counter above a scrollable table area
         tablePreview.innerHTML = '<div class="table-counter">Items: ' + filteredRows.length + '</div><div class="table-scroll">' + renderTable(filteredHeaders, filteredRows) + '</div>';
         tablePreview.style.display = 'block';
 
+        const editedItems = document.getElementById('editedItems');
+        const editedList = document.getElementById('editedList');
+        const editBar = document.getElementById('editBar');
+        const editBarText = document.getElementById('editBarText');
+        const finishEditBtn = document.getElementById('finishEditBtn');
+        if (editedItems && editedList) {
+            editedItems.style.display = 'block';
+            editedList.innerHTML = '<span class="muted">No edits yet.</span>';
+        }
+        if (editBar && editBarText && finishEditBtn) {
+            editBar.style.display = 'flex';
+            editBarText.textContent = 'Editing row: —';
+            finishEditBtn.onclick = () => {
+                const tableEl = tablePreview.querySelector('table.preview');
+                if (!tableEl) return;
+                const active = tableEl.querySelector('tr.active-row');
+                if (active) active.classList.remove('active-row');
+                const activeCells = tableEl.querySelectorAll('td[contenteditable="true"]');
+                activeCells.forEach(td => td.removeAttribute('contenteditable'));
+                activeRowIndex = null;
+                editBarText.textContent = 'Editing row: —';
+            };
+        }
+
+        const updateEditedList = () => {
+            if (!editedList) return;
+            if (!editedCells.size) {
+                editedList.innerHTML = '<span class="muted">No edits yet.</span>';
+                return;
+            }
+            const items = Array.from(editedCells.values()).map(e => {
+                const header = currentHeaders[e.col] || ('Column ' + (e.col + 1));
+                return 'Row ' + (e.row + 1) + ' · ' + header + ' = ' + e.value;
+            });
+            editedList.innerHTML = items.map(i => '<div>' + i + '</div>').join('');
+        };
+
         // Update CSV preview (hidden but kept for download)
-        const csvText = buildCSVText(filteredHeaders, filteredRows);
-        csvPreview.textContent = csvText;
+        const updateCsvPreview = () => {
+            const csvText = buildCSVText(currentHeaders, currentRows);
+            csvPreview.textContent = csvText;
+            return csvText;
+        };
+        updateCsvPreview();
+
+        // Wire up row-click editing (only active row is editable)
+        const tableEl = tablePreview.querySelector('table.preview');
+        if (tableEl) {
+            tableEl.onclick = (e) => {
+                const cell = e.target.closest('td');
+                const rowEl = e.target.closest('tr');
+                if (!cell || !rowEl) return;
+                const rowIdx = parseInt(rowEl.getAttribute('data-row'), 10);
+                if (!Number.isFinite(rowIdx)) return;
+
+                // clear previous active row
+                const prev = tableEl.querySelector('tr.active-row');
+                if (prev && prev !== rowEl) {
+                    prev.classList.remove('active-row');
+                    const prevCells = prev.querySelectorAll('td[contenteditable="true"]');
+                    prevCells.forEach(td => td.removeAttribute('contenteditable'));
+                }
+
+                // set new active row
+                rowEl.classList.add('active-row');
+                const rowCells = rowEl.querySelectorAll('td');
+                rowCells.forEach(td => td.setAttribute('contenteditable', 'true'));
+                activeRowIndex = rowIdx;
+                if (editBarText) editBarText.textContent = 'Editing row: ' + (rowIdx + 1);
+                if (cell) cell.focus();
+            };
+
+            tableEl.oninput = (e) => {
+                const cell = e.target.closest('td');
+                const rowEl = e.target.closest('tr');
+                if (!cell || !rowEl) return;
+                const rIdx = parseInt(cell.getAttribute('data-row'), 10);
+                const cIdx = parseInt(cell.getAttribute('data-col'), 10);
+                if (!Number.isFinite(rIdx) || !Number.isFinite(cIdx)) return;
+                if (activeRowIndex === null || rIdx !== activeRowIndex) return;
+                const text = cell.textContent || '';
+                if (currentRows[rIdx]) currentRows[rIdx][cIdx] = text;
+                const key = rIdx + ':' + cIdx;
+                editedCells.set(key, { row: rIdx, col: cIdx, value: text });
+                cell.classList.add('edited-cell');
+                rowEl.classList.add('edited-row');
+                updateEditedList();
+                updateCsvPreview();
+            };
+        }
 
         // Update merge info and download button
         mergeInfo.textContent = 'Merged ' + files.length + ' file(s). Columns exported: ' + filteredHeaders.length + '.';
         downloadBtn.disabled = false;
 
+        updateDownloadLabel();
+
         // Update download action
         downloadBtn.onclick = () => {
-            const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = (files.length === 1 ? files[0].name.replace(/\.(xlsx|xls)$/i, '.csv') : 'merged.csv');
-            a.click();
-            URL.revokeObjectURL(url);
+            const fmt = exportFormat ? exportFormat.value : 'csv';
+            const baseName = (files.length === 1 ? files[0].name.replace(/\.(xlsx|xls)$/i, '') : 'merged');
+            if (fmt === 'csv') {
+                const latestCsv = buildCSVText(currentHeaders, currentRows);
+                const blob = new Blob([latestCsv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = baseName + '.csv';
+                a.click();
+                URL.revokeObjectURL(url);
+            } else if (fmt === 'tsv') {
+                const tsvText = buildDelimitedText(currentHeaders, currentRows, '\t');
+                const blob = new Blob([tsvText], { type: 'text/tab-separated-values;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = baseName + '.tsv';
+                a.click();
+                URL.revokeObjectURL(url);
+            } else if (fmt === 'json') {
+                const data = currentRows.map(r => {
+                    const obj = {};
+                    currentHeaders.forEach((h, i) => {
+                        const key = (h === undefined || h === null || String(h).trim() === '') ? ('Column ' + (i + 1)) : String(h);
+                        obj[key] = r && r[i] !== undefined ? r[i] : '';
+                    });
+                    return obj;
+                });
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = baseName + '.json';
+                a.click();
+                URL.revokeObjectURL(url);
+            } else if (fmt === 'xlsx') {
+                const aoa = [currentHeaders, ...currentRows];
+                const ws = XLSX.utils.aoa_to_sheet(aoa);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+                XLSX.writeFile(wb, baseName + '.xlsx');
+            } else if (fmt === 'pdf') {
+                openPdfPreview(currentHeaders, currentRows);
+            } else if (fmt === 'ofx' || fmt === 'qfx' || fmt === 'qbo') {
+                const ofxText = buildOfxText(currentHeaders, currentRows);
+                const blob = new Blob([ofxText], { type: 'application/x-ofx;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = baseName + '.' + fmt;
+                a.click();
+                URL.revokeObjectURL(url);
+            }
         };
     };
 
